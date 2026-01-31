@@ -29,6 +29,12 @@ def utcnow() -> str:
     return dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 
+def set_terminal_title(title: str) -> None:
+    """Set the terminal window/tab title using ANSI escape codes."""
+    sys.stdout.write(f"\033]0;{title}\007")
+    sys.stdout.flush()
+
+
 def send_json(sock: socket.socket, payload: Dict) -> None:
     data = json.dumps(payload) + LINE_END
     sock.sendall(data.encode("utf-8"))
@@ -291,7 +297,10 @@ class Client:
                         print(f"[system] {msg.get('text')}")
                     elif mtype == "chat":
                         sender = msg.get("sender", {}).get("name", "?")
-                        print(f"[{msg.get('ts')}] {sender}: {msg.get('text')}")
+                        text = msg.get("text", "")
+                        print(f"[{msg.get('ts')}] {sender}: {text}")
+                        if sender != self.profile.name:
+                            set_terminal_title(f"💬 {sender}: {text[:30]}")
         except Exception:
             print("[disconnected]")
             self._receiver_alive.clear()
