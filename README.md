@@ -2,6 +2,8 @@
 
 Dead-simple local-only chat for popup cowork nights. Host starts a room; everyone on the same Wi‑Fi/LAN joins from their terminal. No internet services, no accounts.
 
+![LAN popup pudding](assets/pudding.png)
+
 ## Quick start (participant)
 ```bash
 python popup.py join --host 192.168.50.23 --port 5678 --passphrase secret123
