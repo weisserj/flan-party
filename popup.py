@@ -17,12 +17,29 @@ import signal
 import socket
 import sys
 import threading
+import time
+from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 LINE_END = "\n"
 BUFFER_SIZE = 4096
 PROFILE_CACHE = Path.home() / ".lanpopup_profile.json"
+MAX_MESSAGE_LEN = 500
+MAX_MESSAGE_HISTORY = 1000
+RATE_LIMIT_WINDOW_SECONDS = 5.0
+RATE_LIMIT_MAX_MESSAGES = 5
+PROFILE_FIELD_LIMITS = {
+    "name": 80,
+    "email": 120,
+    "twitter": 80,
+    "github": 80,
+    "working_on": 200,
+    "can_help_with": 200,
+    "want_to_talk_about": 200,
+}
+CONTROL_CHAR_TRANSLATION = {i: None for i in range(32)}
+CONTROL_CHAR_TRANSLATION[127] = None
 
 
 def utcnow() -> str:
@@ -52,6 +69,23 @@ def recv_lines(sock: socket.socket, buffer: bytearray) -> List[Dict]:
     return out
 
 
+def sanitize_text(value: str, max_len: Optional[int]) -> str:
+    if value is None:
+        return ""
+    text = str(value)
+    text = text.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    text = text.translate(CONTROL_CHAR_TRANSLATION)
+    text = text.strip()
+    if max_len is not None and len(text) > max_len:
+        text = text[:max_len]
+    return text
+
+
+def sanitize_optional(value: Optional[str], max_len: int) -> Optional[str]:
+    cleaned = sanitize_text(value or "", max_len)
+    return cleaned or None
+
+
 @dataclasses.dataclass
 class Profile:
     name: str
@@ -65,7 +99,12 @@ class Profile:
     @classmethod
     def from_input(cls) -> "Profile":
         prev = load_cached_profile()
-        def prompt(label: str, default: Optional[str] = None, required: bool = True) -> str:
+        def prompt(
+            label: str,
+            default: Optional[str] = None,
+            required: bool = True,
+            max_len: Optional[int] = None,
+        ) -> str:
             msg = f"{label}" + (f" [{default}]" if default else "") + ": "
             while True:
                 val = input(msg).strip()
@@ -74,15 +113,40 @@ class Profile:
                 if required and not val:
                     print("This field is required.")
                     continue
+                if max_len is not None and len(val) > max_len:
+                    print(f"Please keep this under {max_len} characters.")
+                    continue
                 return val
 
-        name = prompt("Name", prev.get("name") if prev else None)
-        email = prompt("Email", prev.get("email") if prev else None)
-        twitter = prompt("Twitter handle (optional)", prev.get("twitter") if prev else None, required=False)
-        github = prompt("GitHub username (optional)", prev.get("github") if prev else None, required=False)
-        working_on = prompt("What are you working on tonight?", prev.get("working_on") if prev else None)
-        can_help_with = prompt("Who/how can you help?", prev.get("can_help_with") if prev else None)
-        want_to_talk_about = prompt("What would you like to talk about?", prev.get("want_to_talk_about") if prev else None)
+        name = prompt("Name", prev.get("name") if prev else None, max_len=PROFILE_FIELD_LIMITS["name"])
+        email = prompt("Email", prev.get("email") if prev else None, max_len=PROFILE_FIELD_LIMITS["email"])
+        twitter = prompt(
+            "Twitter handle (optional)",
+            prev.get("twitter") if prev else None,
+            required=False,
+            max_len=PROFILE_FIELD_LIMITS["twitter"],
+        )
+        github = prompt(
+            "GitHub username (optional)",
+            prev.get("github") if prev else None,
+            required=False,
+            max_len=PROFILE_FIELD_LIMITS["github"],
+        )
+        working_on = prompt(
+            "What are you working on tonight?",
+            prev.get("working_on") if prev else None,
+            max_len=PROFILE_FIELD_LIMITS["working_on"],
+        )
+        can_help_with = prompt(
+            "Who/how can you help?",
+            prev.get("can_help_with") if prev else None,
+            max_len=PROFILE_FIELD_LIMITS["can_help_with"],
+        )
+        want_to_talk_about = prompt(
+            "What would you like to talk about?",
+            prev.get("want_to_talk_about") if prev else None,
+            max_len=PROFILE_FIELD_LIMITS["want_to_talk_about"],
+        )
         prof = cls(name, email, twitter or None, github or None, working_on, can_help_with, want_to_talk_about)
         cache_profile(dataclasses.asdict(prof))
         return prof
@@ -91,6 +155,7 @@ class Profile:
 def cache_profile(profile_dict: Dict) -> None:
     try:
         PROFILE_CACHE.write_text(json.dumps(profile_dict, indent=2))
+        os.chmod(PROFILE_CACHE, 0o600)
     except Exception as exc:  # noqa: BLE001
         print(f"Warning: could not cache profile ({exc})")
 
@@ -116,6 +181,7 @@ class Server:
         self.messages: List[Dict] = []
         self._shutdown = threading.Event()
         self._lock = threading.Lock()
+        self._rate_limits: Dict[socket.socket, deque] = {}
 
     def start(self) -> None:
         self.summary_dir.mkdir(parents=True, exist_ok=True)
@@ -154,22 +220,56 @@ class Server:
                     client_sock.close()
                     return
 
-            profile = Profile(**messages[0]["profile"])
+            raw_profile = messages[0].get("profile", {})
+            if not isinstance(raw_profile, dict):
+                raw_profile = {}
+            profile = Profile(
+                name=sanitize_text(raw_profile.get("name", "unknown"), PROFILE_FIELD_LIMITS["name"]) or "unknown",
+                email=sanitize_text(raw_profile.get("email", "unknown"), PROFILE_FIELD_LIMITS["email"]) or "unknown",
+                twitter=sanitize_optional(raw_profile.get("twitter"), PROFILE_FIELD_LIMITS["twitter"]),
+                github=sanitize_optional(raw_profile.get("github"), PROFILE_FIELD_LIMITS["github"]),
+                working_on=sanitize_text(
+                    raw_profile.get("working_on", "unknown"), PROFILE_FIELD_LIMITS["working_on"]
+                )
+                or "unknown",
+                can_help_with=sanitize_text(
+                    raw_profile.get("can_help_with", "unknown"), PROFILE_FIELD_LIMITS["can_help_with"]
+                )
+                or "unknown",
+                want_to_talk_about=sanitize_text(
+                    raw_profile.get("want_to_talk_about", "unknown"), PROFILE_FIELD_LIMITS["want_to_talk_about"]
+                )
+                or "unknown",
+            )
             with self._lock:
                 self.clients[client_sock] = profile
+                self._rate_limits[client_sock] = deque()
             self._broadcast({"type": "system", "text": f"{profile.name} joined", "ts": utcnow()})
             print(f"[join] {profile.name} ({addr[0]})")
             while not self._shutdown.is_set():
                 for msg in recv_lines(client_sock, buffer):
+                    if not isinstance(msg, dict):
+                        continue
                     if msg.get("type") == "chat":
+                        if not self._allow_message(client_sock):
+                            try:
+                                send_json(client_sock, {"type": "system", "text": "rate limit: slow down"})
+                            except Exception:
+                                pass
+                            continue
+                        text = sanitize_text(msg.get("text", ""), MAX_MESSAGE_LEN)
+                        if not text:
+                            continue
                         enriched = {
                             "type": "chat",
                             "ts": utcnow(),
-                            "text": msg.get("text", ""),
+                            "text": text,
                             "sender": dataclasses.asdict(profile),
                         }
                         with self._lock:
                             self.messages.append(enriched)
+                            if len(self.messages) > MAX_MESSAGE_HISTORY:
+                                del self.messages[:-MAX_MESSAGE_HISTORY]
                         self._broadcast(enriched)
                     elif msg.get("type") == "leave":
                         raise ConnectionError("client requested leave")
@@ -178,6 +278,7 @@ class Server:
         finally:
             with self._lock:
                 prof = self.clients.pop(client_sock, None)
+                self._rate_limits.pop(client_sock, None)
             client_sock.close()
             if prof:
                 self._broadcast({"type": "system", "text": f"{prof.name} left", "ts": utcnow()})
@@ -197,6 +298,20 @@ class Server:
                 sock.close()
             except Exception:
                 pass
+
+    def _allow_message(self, client_sock: socket.socket) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            history = self._rate_limits.get(client_sock)
+            if history is None:
+                history = deque()
+                self._rate_limits[client_sock] = history
+            while history and (now - history[0]) > RATE_LIMIT_WINDOW_SECONDS:
+                history.popleft()
+            if len(history) >= RATE_LIMIT_MAX_MESSAGES:
+                return False
+            history.append(now)
+        return True
 
     def _host_loop(self) -> None:
         print("[host] Commands: /who, /save, /quit")
@@ -288,10 +403,12 @@ class Client:
                 for msg in recv_lines(self.sock, buffer):
                     mtype = msg.get("type")
                     if mtype == "system":
-                        print(f"[system] {msg.get('text')}")
+                        text = sanitize_text(msg.get("text", ""), MAX_MESSAGE_LEN)
+                        print(f"[system] {text}")
                     elif mtype == "chat":
                         sender = msg.get("sender", {}).get("name", "?")
-                        print(f"[{msg.get('ts')}] {sender}: {msg.get('text')}")
+                        text = sanitize_text(msg.get("text", ""), MAX_MESSAGE_LEN)
+                        print(f"[{msg.get('ts')}] {sender}: {text}")
         except Exception:
             print("[disconnected]")
             self._receiver_alive.clear()
@@ -307,6 +424,9 @@ class Client:
                 if line.strip() == "/quit":
                     send_json(self.sock, {"type": "leave"})
                     break
+                if len(line) > MAX_MESSAGE_LEN:
+                    print(f"[warning] Message too long; truncating to {MAX_MESSAGE_LEN} characters.")
+                    line = line[:MAX_MESSAGE_LEN]
                 if line.strip():
                     send_json(self.sock, {"type": "chat", "text": line})
         finally:
