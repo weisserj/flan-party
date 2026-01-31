@@ -390,7 +390,11 @@ def parse_args() -> argparse.Namespace:
     host_parser.add_argument("--host", default="0.0.0.0", help="bind address (default all interfaces)")
     host_parser.add_argument("--port", type=int, default=5678)
     host_parser.add_argument("--session-name", default="Late Night Coffeeshop")
-    host_parser.add_argument("--summary-dir", default="summaries")
+    host_parser.add_argument(
+        "--summary-dir",
+        default=str(Path.home() / "lan-popup-summaries"),
+        help="directory for summaries/autosaves (default: ~/lan-popup-summaries)",
+    )
     host_parser.add_argument("--passphrase", default=None, help="optional shared passphrase required to join")
 
     join_parser = sub.add_parser("join", help="join an existing popup session")
