@@ -174,6 +174,7 @@ class Server:
                 if key not in self._participants_seen_keys:
                     self._participants_seen_keys.add(key)
                     self.participants_seen.append(profile)
+                    self._write_roster_snapshot()
                 roster = [p.public_dict() for p in self.participants_seen]
 
             # Send roster to the new participant (no chat history)
@@ -300,6 +301,20 @@ class Server:
             print(f"[host] Wrote {summary_path} and {email_path}")
         except Exception as exc:  # noqa: BLE001
             print(f"[host] Failed to write summaries: {exc}")
+
+    def _write_roster_snapshot(self) -> None:
+        """Persist participant roster (including emails) on each first join."""
+        try:
+            self.summary_dir.mkdir(parents=True, exist_ok=True)
+            path = self.summary_dir / "roster_autosave.json"
+            data = {
+                "ts": utcnow(),
+                "session": self.session_name,
+                "participants": [dataclasses.asdict(p) for p in self.participants_seen],
+            }
+            path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[host] Failed to autosave roster: {exc}")
 
 
 class Client:
