@@ -136,6 +136,44 @@ def save_session_cache(host: str, port: int, session_id: str) -> None:
 
 # --- Proximity Scanner (Phase 4) ---
 
+def get_local_ble_addr() -> Optional[str]:
+    """Get local Bluetooth MAC address (platform-specific)."""
+    system = platform.system().lower()
+    try:
+        if system == "darwin":
+            result = subprocess.run(
+                ["system_profiler", "SPBluetoothDataType"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if line.startswith("Address:") or line.startswith("address:"):
+                    addr = line.split(":", 1)[1].strip()
+                    if addr:
+                        return addr
+        elif system == "linux":
+            addr_path = Path("/sys/class/bluetooth/hci0/address")
+            if addr_path.exists():
+                addr = addr_path.read_text().strip()
+                if addr and addr != "00:00:00:00:00:00":
+                    return addr
+        elif system == "windows":
+            result = subprocess.run(
+                ["getmac", "/FO", "CSV", "/NH", "/V"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in result.stdout.splitlines():
+                if "Bluetooth" in line:
+                    parts = line.split(",")
+                    if len(parts) >= 2:
+                        addr = parts[1].strip().strip('"')
+                        if addr and addr != "N/A":
+                            return addr
+    except Exception:
+        pass
+    return None
+
+
 class ProximityScanner:
     """Background BLE/RTT proximity scanner."""
 
@@ -144,6 +182,7 @@ class ProximityScanner:
         self._get_peer_ips = get_peer_ips_cb
         self._stop = threading.Event()
         self._has_bleak = False
+        self._local_ble_addr = get_local_ble_addr()
         try:
             import bleak  # noqa: F401
             self._has_bleak = True
@@ -159,16 +198,21 @@ class ProximityScanner:
 
     def _scan_loop(self) -> None:
         while not self._stop.is_set():
+            results = []
+            if self._has_bleak:
+                try:
+                    results.extend(self._ble_scan())
+                except Exception:
+                    pass
             try:
-                if self._has_bleak:
-                    self._ble_scan()
-                else:
-                    self._rtt_scan()
+                results.extend(self._rtt_scan())
             except Exception:
                 pass
+            if results or self._local_ble_addr:
+                self._send_report(results, self._local_ble_addr)
             self._stop.wait(15)
 
-    def _ble_scan(self) -> None:
+    def _ble_scan(self) -> List[Dict]:
         import bleak
 
         async def _do_scan():
@@ -185,23 +229,20 @@ class ProximityScanner:
 
         loop = asyncio.new_event_loop()
         try:
-            results = loop.run_until_complete(_do_scan())
+            return loop.run_until_complete(_do_scan())
         finally:
             loop.close()
-        if results:
-            self._send_report(results)
 
-    def _rtt_scan(self) -> None:
+    def _rtt_scan(self) -> List[Dict]:
         peer_ips = self._get_peer_ips()
         if not peer_ips:
-            return
+            return []
         results = []
         for ip in peer_ips:
             rtt = self._ping_rtt(ip)
             if rtt is not None:
                 results.append({"addr": ip, "rssi": None, "name": "", "rtt_ms": rtt})
-        if results:
-            self._send_report(results)
+        return results
 
     @staticmethod
     def _ping_rtt(ip: str) -> Optional[float]:
@@ -418,48 +459,61 @@ class Server:
     def _broadcast_participants(self) -> None:
         self._broadcast(self._build_participants_msg())
 
-    def _compute_proximity(self, key: str) -> List[Dict]:
-        """Cross-reference BLE scans to find who is near whom."""
+    def _compute_proximity(self, my_sock: socket.socket) -> List[Dict]:
+        """Cross-reference BLE scans, RTT pings, and co-location to find who is near whom."""
         with self._lock:
-            my_scans = self.client_scans.get(key, [])
-            if not my_scans:
+            my_prof = self.clients.get(my_sock)
+            if not my_prof:
                 return []
-            # Build addr -> name mapping from all clients' BLE addresses
-            addr_to_name: Dict[str, str] = {}
-            for k, addr in self.client_ble_addr.items():
-                if k != key:
-                    name = k.split(":")[0]
-                    addr_to_name[addr.upper()] = name
-            # Match scanned addresses
-            nearby = []
-            for scan in my_scans:
-                addr = scan.get("addr", "").upper()
-                if addr in addr_to_name:
-                    nearby.append({
-                        "name": addr_to_name[addr],
-                        "rssi": scan.get("rssi"),
-                        "rtt_ms": scan.get("rtt_ms"),
-                    })
-            # Also handle RTT-based proximity (match by IP)
-            ip_to_name: Dict[str, str] = {}
-            for sock, prof in self.clients.items():
-                k2 = self._participant_key(prof)
-                if k2 != key:
-                    ip = self.client_ips.get(sock, "")
-                    if ip:
-                        ip_to_name[ip] = prof.name
-            for scan in my_scans:
-                addr = scan.get("addr", "")
-                if addr in ip_to_name and not any(n["name"] == ip_to_name[addr] for n in nearby):
-                    nearby.append({
-                        "name": ip_to_name[addr],
-                        "rssi": scan.get("rssi"),
-                        "rtt_ms": scan.get("rtt_ms"),
-                    })
-            # Sort by RSSI (higher=closer) or RTT (lower=closer)
+            my_ip = self.client_ips.get(my_sock, "")
+            my_key = self._participant_key(my_prof)
+            nearby_names: Dict[str, Dict] = {}  # name -> best proximity info
+
+            # 1) Co-location: other sockets sharing the same IP are nearby
+            if my_ip:
+                for sock, prof in self.clients.items():
+                    if sock is not my_sock and self.client_ips.get(sock, "") == my_ip:
+                        nearby_names[prof.name] = {"name": prof.name, "rssi": None, "rtt_ms": 0.0}
+
+            # 2) BLE address matching from scan results
+            my_scans = self.client_scans.get(my_key, [])
+            if my_scans:
+                addr_to_name: Dict[str, str] = {}
+                for k, addr in self.client_ble_addr.items():
+                    if k != my_key:
+                        name = k.split(":")[0]
+                        addr_to_name[addr.upper()] = name
+                for scan in my_scans:
+                    addr = scan.get("addr", "").upper()
+                    if addr in addr_to_name:
+                        name = addr_to_name[addr]
+                        nearby_names[name] = {
+                            "name": name,
+                            "rssi": scan.get("rssi"),
+                            "rtt_ms": scan.get("rtt_ms"),
+                        }
+
+                # 3) RTT-based proximity (match scanned IP to client IP)
+                ip_to_name: Dict[str, str] = {}
+                for sock, prof in self.clients.items():
+                    if sock is not my_sock:
+                        ip = self.client_ips.get(sock, "")
+                        if ip:
+                            ip_to_name[ip] = prof.name
+                for scan in my_scans:
+                    addr = scan.get("addr", "")
+                    if addr in ip_to_name and ip_to_name[addr] not in nearby_names:
+                        name = ip_to_name[addr]
+                        nearby_names[name] = {
+                            "name": name,
+                            "rssi": scan.get("rssi"),
+                            "rtt_ms": scan.get("rtt_ms"),
+                        }
+
+            nearby = list(nearby_names.values())
             def sort_key(item):
                 if item.get("rssi") is not None:
-                    return -item["rssi"]  # higher RSSI = closer, so negate for ascending
+                    return -item["rssi"]
                 if item.get("rtt_ms") is not None:
                     return item["rtt_ms"]
                 return 9999
@@ -520,6 +574,7 @@ class Server:
                 print(f"[join] {profile.name} ({addr[0]})")
 
             self._broadcast_participants()
+            self._send_proximity_updates()
 
             while not self._shutdown.is_set():
                 for msg in recv_lines(client_sock, buffer):
@@ -555,14 +610,14 @@ class Server:
                 self._broadcast({"type": "system", "text": f"{prof.name} left", "ts": utcnow()})
                 print(f"[left] {prof.name} ({addr[0]})")
                 self._broadcast_participants()
+                self._send_proximity_updates()
 
     def _send_proximity_updates(self) -> None:
         """Send proximity_update to each connected client."""
         with self._lock:
             clients_snapshot = list(self.clients.items())
         for sock, prof in clients_snapshot:
-            key = self._participant_key(prof)
-            nearby = self._compute_proximity(key)
+            nearby = self._compute_proximity(sock)
             try:
                 send_json(sock, {"type": "proximity_update", "nearby": nearby})
             except Exception:
@@ -680,8 +735,6 @@ class Client:
             print(text)
 
     def _update_status(self) -> None:
-        if not self._ui:
-            return
         parts = []
         if self.session_name:
             parts.append(self.session_name)
@@ -692,7 +745,17 @@ class Client:
             if self.nearby:
                 names = ", ".join(n["name"] for n in self.nearby)
                 parts.append(f"nearby: {names}")
-        self._ui.set_status(" | ".join(parts))
+        status = " | ".join(parts)
+        if self._ui:
+            self._ui.set_status(status)
+
+    def _on_nearby_changed(self) -> None:
+        with self._nearby_lock:
+            if self.nearby:
+                names = ", ".join(n["name"] for n in self.nearby)
+                self._display(f"[nearby] {names}")
+            else:
+                self._display("[nearby] no one detected nearby")
 
     def start(self) -> None:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -739,11 +802,14 @@ class Client:
             finally:
                 scanner.stop()
 
-    def _send_proximity_report(self, scans: List[Dict]) -> None:
+    def _send_proximity_report(self, scans: List[Dict], ble_addr: Optional[str] = None) -> None:
         if not self._receiver_alive.is_set():
             return
         try:
-            self._send_json({"type": "proximity_report", "scans": scans})
+            msg = {"type": "proximity_report", "scans": scans}
+            if ble_addr:
+                msg["ble_addr"] = ble_addr
+            self._send_json(msg)
         except Exception:
             pass
 
@@ -798,8 +864,11 @@ class Client:
                     elif mtype == "proximity_update":
                         nearby = msg.get("nearby", [])
                         with self._nearby_lock:
+                            old = self.nearby
                             self.nearby = nearby
                         self._update_status()
+                        if nearby != old:
+                            self._on_nearby_changed()
         except Exception:
             self._display("[disconnected]")
             self._receiver_alive.clear()
