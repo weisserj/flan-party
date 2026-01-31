@@ -62,6 +62,17 @@ class Profile:
     can_help_with: str
     want_to_talk_about: str
 
+    def public_dict(self) -> Dict[str, Optional[str]]:
+        """Return profile info safe to share with other participants (no email)."""
+        return {
+            "name": self.name,
+            "twitter": self.twitter,
+            "github": self.github,
+            "working_on": self.working_on,
+            "can_help_with": self.can_help_with,
+            "want_to_talk_about": self.want_to_talk_about,
+        }
+
     @classmethod
     def from_input(cls) -> "Profile":
         prev = load_cached_profile()
@@ -113,6 +124,8 @@ class Server:
         self.passphrase = passphrase
         self.server_sock: Optional[socket.socket] = None
         self.clients: Dict[socket.socket, Profile] = {}
+        self.participants_seen: List[Profile] = []
+        self._participants_seen_keys = set()
         self.messages: List[Dict] = []
         self._shutdown = threading.Event()
         self._lock = threading.Lock()
@@ -157,6 +170,26 @@ class Server:
             profile = Profile(**messages[0]["profile"])
             with self._lock:
                 self.clients[client_sock] = profile
+                key = (profile.name, profile.email)
+                if key not in self._participants_seen_keys:
+                    self._participants_seen_keys.add(key)
+                    self.participants_seen.append(profile)
+                roster = [p.public_dict() for p in self.participants_seen]
+
+            # Send roster to the new participant (no chat history)
+            try:
+                send_json(client_sock, {"type": "roster", "participants": roster, "ts": utcnow()})
+            except Exception:
+                pass
+
+            # Broadcast their profile to everyone (including existing users)
+            self._broadcast(
+                {
+                    "type": "profile",
+                    "ts": utcnow(),
+                    "participant": profile.public_dict(),
+                }
+            )
             self._broadcast({"type": "system", "text": f"{profile.name} joined", "ts": utcnow()})
             print(f"[join] {profile.name} ({addr[0]})")
             while not self._shutdown.is_set():
@@ -289,6 +322,17 @@ class Client:
                     mtype = msg.get("type")
                     if mtype == "system":
                         print(f"[system] {msg.get('text')}")
+                    elif mtype == "roster":
+                        print("[people] Current participants:")
+                        for p in msg.get("participants", []):
+                            print(
+                                f" - {p.get('name')} | working on: {p.get('working_on')} | can help: {p.get('can_help_with')} | wants to talk about: {p.get('want_to_talk_about')} | twitter: {p.get('twitter') or '-'} | github: {p.get('github') or '-'}"
+                            )
+                    elif mtype == "profile":
+                        p = msg.get("participant", {})
+                        print(
+                            f"[people] {p.get('name')} joined — working on {p.get('working_on')}; can help with {p.get('can_help_with')}; wants to talk about {p.get('want_to_talk_about')}; twitter: {p.get('twitter') or '-'}; github: {p.get('github') or '-'}"
+                        )
                     elif mtype == "chat":
                         sender = msg.get("sender", {}).get("name", "?")
                         print(f"[{msg.get('ts')}] {sender}: {msg.get('text')}")
