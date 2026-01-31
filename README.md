@@ -2,7 +2,7 @@
 
 Dead-simple local-only chat for popup cowork nights. Host starts a room; everyone on the same Wi‑Fi/LAN joins from their terminal. No internet services, no accounts.
 
-![LAN popup pudding](assets/pudding.png)
+![LAN popup pudding](./assets/pudding.png)
 
 ## Quick start (participant)
 ```bash
