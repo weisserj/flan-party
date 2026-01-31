@@ -1,4 +1,4 @@
-# FLAN PARTY: Popup Chat in CLI for on local area networks.
+# FLAN PARTY: Popup Chat in CLI for local area networks.
 
 Dead-simple local-only chat for popup cowork nights. Host starts a room; everyone on the same Wi‑Fi/LAN joins from their terminal. No internet services, no accounts.
 
