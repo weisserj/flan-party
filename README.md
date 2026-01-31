@@ -5,7 +5,9 @@ Dead-simple local-only chat for popup cowork nights. Host starts a room; everyon
 ![LAN popup pudding](./assets/pudding.png)
 
 ## Quick start (participant)
+Download (no clone needed):
 ```bash
+curl -L -o popup.py https://raw.githubusercontent.com/weisserj/flan-party/weisserj/lan-cli-chat/popup.py
 python popup.py join --host 192.168.50.23 --port 5678 --passphrase secret123
 ```
 
