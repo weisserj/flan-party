@@ -257,6 +257,8 @@ class Server:
         self.write_summary()
 
     def write_summary(self) -> None:
+        # Ensure directory exists even if removed during runtime
+        self.summary_dir.mkdir(parents=True, exist_ok=True)
         now = dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
         summary_path = self.summary_dir / f"{now}_{self.session_name.replace(' ', '_')}_summary.md"
         email_path = summary_path.with_suffix(".email.txt")
@@ -292,8 +294,12 @@ class Server:
         for m in messages:
             email_lines.append(f"- {m['text']}")
         email_lines.append("\nReply-all with updates or follow-ups!")
-        email_path.write_text("\n".join(email_lines), encoding="utf-8")
-        print(f"[host] Wrote {summary_path} and {email_path}")
+        try:
+            summary_path.write_text("\n".join(lines), encoding="utf-8")
+            email_path.write_text("\n".join(email_lines), encoding="utf-8")
+            print(f"[host] Wrote {summary_path} and {email_path}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[host] Failed to write summaries: {exc}")
 
 
 class Client:
