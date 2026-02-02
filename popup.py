@@ -13,6 +13,7 @@ import datetime as dt
 import json
 import os
 import queue
+import re
 import signal
 import socket
 import sys
@@ -31,7 +32,9 @@ def utcnow() -> str:
 
 def set_terminal_title(title: str) -> None:
     """Set the terminal window/tab title using ANSI escape codes."""
-    sys.stdout.write(f"\033]0;{title}\007")
+    # Sanitize control characters to prevent escape sequence injection
+    clean = re.sub(r'[\x00-\x1f\x7f]', '', title)
+    sys.stdout.write(f"\033]0;{clean}\007")
     sys.stdout.flush()
 
 
@@ -277,15 +280,40 @@ class Client:
         self.passphrase = passphrase
         self.sock: Optional[socket.socket] = None
         self._receiver_alive = threading.Event()
+        self._unread_count = 0
+        self._unread_senders: List[str] = []  # first 3 unique senders
+        self._notif_lock = threading.Lock()
 
     def start(self) -> None:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.connect((self.host, self.port))
         send_json(self.sock, {"type": "hello", "profile": dataclasses.asdict(self.profile), "passphrase": self.passphrase})
         print(f"Connected to {self.host}:{self.port}. Type your messages; /quit to leave.")
+        set_terminal_title('⛵ Flan Party')
         self._receiver_alive.set()
         threading.Thread(target=self._recv_loop, daemon=True).start()
         self._send_loop()
+
+    def _add_unread(self, sender: str) -> None:
+        """Track an unread message and update terminal title."""
+        with self._notif_lock:
+            self._unread_count += 1
+            if sender not in self._unread_senders and len(self._unread_senders) < 3:
+                self._unread_senders.append(sender)
+            self._update_title()
+
+    def _clear_unread(self) -> None:
+        """Clear unread state and reset terminal title."""
+        with self._notif_lock:
+            self._unread_count = 0
+            self._unread_senders.clear()
+            set_terminal_title('⛵ Flan Party')
+
+    def _update_title(self) -> None:
+        """Update terminal title with unread count and senders."""
+        if self._unread_count > 0:
+            people = ', '.join(self._unread_senders)
+            set_terminal_title(f"{self._unread_count} • {people}")
 
     def _recv_loop(self) -> None:
         buffer = bytearray()
@@ -300,7 +328,7 @@ class Client:
                         text = msg.get("text", "")
                         print(f"[{msg.get('ts')}] {sender}: {text}")
                         if sender != self.profile.name:
-                            set_terminal_title(f"💬 {sender}: {text[:30]}")
+                            self._add_unread(sender)
         except Exception:
             print("[disconnected]")
             self._receiver_alive.clear()
@@ -318,8 +346,10 @@ class Client:
                     break
                 if line.strip():
                     send_json(self.sock, {"type": "chat", "text": line})
+                    self._clear_unread()
         finally:
             self._receiver_alive.clear()
+            set_terminal_title('⛵ Flan Party')
             try:
                 self.sock.close()
             except Exception:
