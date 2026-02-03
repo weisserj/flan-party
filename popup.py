@@ -13,6 +13,7 @@ import datetime as dt
 import json
 import os
 import queue
+import re
 import signal
 import socket
 import sys
@@ -40,6 +41,15 @@ PROFILE_FIELD_LIMITS = {
 }
 CONTROL_CHAR_TRANSLATION = {i: None for i in range(32)}
 CONTROL_CHAR_TRANSLATION[127] = None
+
+
+def set_terminal_title(title: str) -> None:
+    """Set the terminal window/tab title using ANSI escape codes."""
+    if os.environ.get("FLAN_NO_TITLE") or not sys.stdout.isatty():
+        return
+    clean = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', title)
+    sys.stdout.write(f"\033]0;{clean}\007")
+    sys.stdout.flush()
 
 
 def utcnow() -> str:
@@ -386,12 +396,34 @@ class Client:
         self.passphrase = passphrase
         self.sock: Optional[socket.socket] = None
         self._receiver_alive = threading.Event()
+        self._unread_count = 0
+        self._unread_senders: List[str] = []
+        self._notif_lock = threading.Lock()
+
+    def _add_unread(self, sender: str) -> None:
+        with self._notif_lock:
+            self._unread_count += 1
+            if sender not in self._unread_senders and len(self._unread_senders) < 3:
+                self._unread_senders.append(sender)
+            self._update_title()
+
+    def _clear_unread(self) -> None:
+        with self._notif_lock:
+            self._unread_count = 0
+            self._unread_senders.clear()
+            set_terminal_title('\u26f5 Flan Party')
+
+    def _update_title(self) -> None:
+        if self._unread_count > 0:
+            people = ', '.join(self._unread_senders)
+            set_terminal_title(f"{self._unread_count} \u2022 {people}")
 
     def start(self) -> None:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.connect((self.host, self.port))
         send_json(self.sock, {"type": "hello", "profile": dataclasses.asdict(self.profile), "passphrase": self.passphrase})
         print(f"Connected to {self.host}:{self.port}. Type your messages; /quit to leave.")
+        set_terminal_title('\u26f5 Flan Party')
         self._receiver_alive.set()
         threading.Thread(target=self._recv_loop, daemon=True).start()
         self._send_loop()
@@ -409,6 +441,8 @@ class Client:
                         sender = msg.get("sender", {}).get("name", "?")
                         text = sanitize_text(msg.get("text", ""), MAX_MESSAGE_LEN)
                         print(f"[{msg.get('ts')}] {sender}: {text}")
+                        if sender != self.profile.name:
+                            self._add_unread(sender)
         except Exception:
             print("[disconnected]")
             self._receiver_alive.clear()
@@ -429,8 +463,10 @@ class Client:
                     line = line[:MAX_MESSAGE_LEN]
                 if line.strip():
                     send_json(self.sock, {"type": "chat", "text": line})
+                    self._clear_unread()
         finally:
             self._receiver_alive.clear()
+            self._clear_unread()
             try:
                 self.sock.close()
             except Exception:
