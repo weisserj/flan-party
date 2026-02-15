@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""LAN-only popup chat for late-night coffeeshop events.
+"""Flan Party — popup social chat for your LAN.
 
 Run as host (admin):
-  python popup.py host --port 5678 --session-name "Late Night" --summary-dir summaries
+  python popup.py host --port 5678 --session-name "Hack Night" --summary-dir summaries
 
 Run as participant:
   python popup.py join --host 192.168.1.23 --port 5678
@@ -30,15 +30,21 @@ MAX_MESSAGE_LEN = 500
 MAX_MESSAGE_HISTORY = 1000
 RATE_LIMIT_WINDOW_SECONDS = 5.0
 RATE_LIMIT_MAX_MESSAGES = 5
-PROFILE_FIELD_LIMITS = {
+IDENTITY_FIELD_LIMITS = {
     "name": 80,
     "email": 120,
     "twitter": 80,
     "github": 80,
-    "working_on": 200,
-    "can_help_with": 200,
-    "want_to_talk_about": 200,
 }
+ANSWER_MAX_LEN = 200
+MAX_QUESTIONS = 10
+MAX_QUESTION_KEY_LEN = 40
+MAX_QUESTION_PROMPT_LEN = 200
+DEFAULT_QUESTIONS: List[Dict] = [
+    {"key": "working_on", "prompt": "What are you working on tonight?", "required": True},
+    {"key": "can_help_with", "prompt": "Who/how can you help?", "required": True},
+    {"key": "want_to_talk_about", "prompt": "What would you like to talk about?", "required": True},
+]
 CONTROL_CHAR_TRANSLATION = {i: None for i in range(32)}
 CONTROL_CHAR_TRANSLATION[127] = None
 
@@ -96,20 +102,145 @@ def sanitize_optional(value: Optional[str], max_len: int) -> Optional[str]:
     return cleaned or None
 
 
+def validate_questions(questions: List[Dict]) -> List[Dict]:
+    """Validate and return a cleaned list of question definitions."""
+    if not isinstance(questions, list):
+        raise ValueError("questions must be a list")
+    if len(questions) > MAX_QUESTIONS:
+        raise ValueError(f"too many questions (max {MAX_QUESTIONS})")
+    seen_keys: set = set()
+    validated = []
+    for q in questions:
+        if not isinstance(q, dict):
+            raise ValueError("each question must be an object")
+        key = q.get("key", "")
+        prompt = q.get("prompt", "")
+        required = q.get("required", True)
+        if not isinstance(key, str) or not re.match(r"^[a-z][a-z0-9_]*$", key):
+            raise ValueError(f"invalid question key: {key!r} (must match [a-z][a-z0-9_]*)")
+        if len(key) > MAX_QUESTION_KEY_LEN:
+            raise ValueError(f"question key too long: {key!r}")
+        if key in seen_keys:
+            raise ValueError(f"duplicate question key: {key!r}")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError(f"question {key!r} has empty prompt")
+        if len(prompt) > MAX_QUESTION_PROMPT_LEN:
+            raise ValueError(f"question {key!r} prompt too long")
+        seen_keys.add(key)
+        validated.append({"key": key, "prompt": prompt.strip(), "required": bool(required)})
+    return validated
+
+
+def _slugify_key(prompt: str) -> str:
+    """Turn a question prompt into a snake_case key."""
+    key = re.sub(r"[^a-z0-9]+", "_", prompt.lower()).strip("_")
+    return key[:MAX_QUESTION_KEY_LEN] or "question"
+
+
+def _dedupe_keys(questions: List[Dict]) -> List[Dict]:
+    """Append _2, _3, etc. to duplicate keys."""
+    seen: Dict[str, int] = {}
+    out = []
+    for q in questions:
+        base = q["key"]
+        if base in seen:
+            seen[base] += 1
+            q = {**q, "key": f"{base}_{seen[base]}"[:MAX_QUESTION_KEY_LEN]}
+        else:
+            seen[base] = 1
+        out.append(q)
+    return out
+
+
+def prompt_host_setup(
+    cli_session_name: Optional[str],
+) -> Tuple[str, List[Dict]]:
+    """Interactively prompt the host for session name and questions."""
+    default_name = "Flan Party"
+    if cli_session_name:
+        session_name = cli_session_name
+    else:
+        val = input(f"Session name [{default_name}]: ").strip()
+        session_name = val or default_name
+
+    print("\nQuestions for participants (press Enter on blank line when done):\n")
+    print("Defaults:")
+    for i, q in enumerate(DEFAULT_QUESTIONS, 1):
+        print(f"  {i}. {q['prompt']}")
+
+    use_defaults = input("\nUse defaults? [Y/n]: ").strip().lower()
+    if use_defaults in ("", "y", "yes"):
+        return session_name, list(DEFAULT_QUESTIONS)
+
+    questions: List[Dict] = []
+    num = 1
+    while num <= MAX_QUESTIONS:
+        prompt_text = input(f"Question {num}: ").strip()
+        if not prompt_text:
+            break
+        if len(prompt_text) > MAX_QUESTION_PROMPT_LEN:
+            print(f"Please keep under {MAX_QUESTION_PROMPT_LEN} characters.")
+            continue
+        req = input("Required? [Y/n]: ").strip().lower()
+        required = req in ("", "y", "yes")
+        questions.append({
+            "key": _slugify_key(prompt_text),
+            "prompt": prompt_text,
+            "required": required,
+        })
+        num += 1
+
+    if not questions:
+        print("No questions defined, using defaults.")
+        return session_name, list(DEFAULT_QUESTIONS)
+
+    questions = _dedupe_keys(questions)
+    print(f"({len(questions)} question{'s' if len(questions) != 1 else ''} defined)")
+    return session_name, validate_questions(questions)
+
+
+def load_questions_file(path: str) -> List[Dict]:
+    """Load and validate questions from a JSON file."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read questions file: {exc}") from exc
+    return validate_questions(data)
+
+
 @dataclasses.dataclass
 class Profile:
     name: str
     email: str
     twitter: Optional[str]
     github: Optional[str]
-    working_on: str
-    can_help_with: str
-    want_to_talk_about: str
+    answers: Dict[str, str]
+
+    def to_dict(self) -> Dict:
+        return {
+            "name": self.name,
+            "email": self.email,
+            "twitter": self.twitter,
+            "github": self.github,
+            "answers": dict(self.answers),
+        }
 
     @classmethod
-    def from_input(cls) -> "Profile":
+    def from_dict(cls, data: Dict) -> "Profile":
+        return cls(
+            name=data.get("name", "unknown"),
+            email=data.get("email", "unknown"),
+            twitter=data.get("twitter"),
+            github=data.get("github"),
+            answers=data.get("answers", {}),
+        )
+
+    @classmethod
+    def from_input(cls, questions: List[Dict]) -> "Profile":
         prev = load_cached_profile()
-        def prompt(
+        prev_answers = (prev.get("answers", {}) if prev else {})
+
+        def ask(
             label: str,
             default: Optional[str] = None,
             required: bool = True,
@@ -128,37 +259,38 @@ class Profile:
                     continue
                 return val
 
-        name = prompt("Name", prev.get("name") if prev else None, max_len=PROFILE_FIELD_LIMITS["name"])
-        email = prompt("Email", prev.get("email") if prev else None, max_len=PROFILE_FIELD_LIMITS["email"])
-        twitter = prompt(
+        name = ask("Name", prev.get("name") if prev else None, max_len=IDENTITY_FIELD_LIMITS["name"])
+        # If a different person is using the same machine, don't suggest the old profile
+        if prev and name != prev.get("name"):
+            prev = None
+            prev_answers = {}
+        email = ask("Email", prev.get("email") if prev else None, max_len=IDENTITY_FIELD_LIMITS["email"])
+        twitter = ask(
             "Twitter handle (optional)",
             prev.get("twitter") if prev else None,
             required=False,
-            max_len=PROFILE_FIELD_LIMITS["twitter"],
+            max_len=IDENTITY_FIELD_LIMITS["twitter"],
         )
-        github = prompt(
+        github = ask(
             "GitHub username (optional)",
             prev.get("github") if prev else None,
             required=False,
-            max_len=PROFILE_FIELD_LIMITS["github"],
+            max_len=IDENTITY_FIELD_LIMITS["github"],
         )
-        working_on = prompt(
-            "What are you working on tonight?",
-            prev.get("working_on") if prev else None,
-            max_len=PROFILE_FIELD_LIMITS["working_on"],
-        )
-        can_help_with = prompt(
-            "Who/how can you help?",
-            prev.get("can_help_with") if prev else None,
-            max_len=PROFILE_FIELD_LIMITS["can_help_with"],
-        )
-        want_to_talk_about = prompt(
-            "What would you like to talk about?",
-            prev.get("want_to_talk_about") if prev else None,
-            max_len=PROFILE_FIELD_LIMITS["want_to_talk_about"],
-        )
-        prof = cls(name, email, twitter or None, github or None, working_on, can_help_with, want_to_talk_about)
-        cache_profile(dataclasses.asdict(prof))
+
+        answers: Dict[str, str] = {}
+        for q in questions:
+            val = ask(
+                q["prompt"],
+                prev_answers.get(q["key"]),
+                required=q.get("required", True),
+                max_len=ANSWER_MAX_LEN,
+            )
+            if val:
+                answers[q["key"]] = val
+
+        prof = cls(name, email, twitter or None, github or None, answers)
+        cache_profile(prof.to_dict())
         return prof
 
 
@@ -180,14 +312,18 @@ def load_cached_profile() -> Optional[Dict]:
 
 
 class Server:
-    def __init__(self, host: str, port: int, session_name: str, summary_dir: Path, passphrase: Optional[str]):
+    def __init__(self, host: str, port: int, session_name: str, summary_dir: Path,
+                 passphrase: Optional[str], questions: List[Dict]):
         self.host = host
         self.port = port
         self.session_name = session_name
         self.summary_dir = summary_dir
         self.passphrase = passphrase
+        self.questions = questions
+        self.question_labels: Dict[str, str] = {q["key"]: q["prompt"] for q in questions}
         self.server_sock: Optional[socket.socket] = None
         self.clients: Dict[socket.socket, Profile] = {}
+        self.departed: List[Profile] = []
         self.messages: List[Dict] = []
         self._shutdown = threading.Event()
         self._lock = threading.Lock()
@@ -215,6 +351,8 @@ class Server:
     def _client_thread(self, client_sock: socket.socket, addr: Tuple[str, int]) -> None:
         buffer = bytearray()
         try:
+            # Send questions to client
+            send_json(client_sock, {"type": "welcome", "questions": self.questions})
             # Expect hello
             messages = recv_lines(client_sock, buffer)
             if not messages or messages[0].get("type") != "hello":
@@ -230,26 +368,27 @@ class Server:
                     client_sock.close()
                     return
 
-            raw_profile = messages[0].get("profile", {})
-            if not isinstance(raw_profile, dict):
-                raw_profile = {}
+            hello = messages[0]
+            identity = hello.get("identity", {})
+            if not isinstance(identity, dict):
+                identity = {}
+            raw_answers = hello.get("answers", {})
+            if not isinstance(raw_answers, dict):
+                raw_answers = {}
+
+            # Sanitize answers — only keep keys matching configured questions, in order
+            answers: Dict[str, str] = {}
+            for q in self.questions:
+                val = sanitize_text(raw_answers.get(q["key"], ""), ANSWER_MAX_LEN)
+                if val:
+                    answers[q["key"]] = val
+
             profile = Profile(
-                name=sanitize_text(raw_profile.get("name", "unknown"), PROFILE_FIELD_LIMITS["name"]) or "unknown",
-                email=sanitize_text(raw_profile.get("email", "unknown"), PROFILE_FIELD_LIMITS["email"]) or "unknown",
-                twitter=sanitize_optional(raw_profile.get("twitter"), PROFILE_FIELD_LIMITS["twitter"]),
-                github=sanitize_optional(raw_profile.get("github"), PROFILE_FIELD_LIMITS["github"]),
-                working_on=sanitize_text(
-                    raw_profile.get("working_on", "unknown"), PROFILE_FIELD_LIMITS["working_on"]
-                )
-                or "unknown",
-                can_help_with=sanitize_text(
-                    raw_profile.get("can_help_with", "unknown"), PROFILE_FIELD_LIMITS["can_help_with"]
-                )
-                or "unknown",
-                want_to_talk_about=sanitize_text(
-                    raw_profile.get("want_to_talk_about", "unknown"), PROFILE_FIELD_LIMITS["want_to_talk_about"]
-                )
-                or "unknown",
+                name=sanitize_text(identity.get("name", "unknown"), IDENTITY_FIELD_LIMITS["name"]) or "unknown",
+                email=sanitize_text(identity.get("email", "unknown"), IDENTITY_FIELD_LIMITS["email"]) or "unknown",
+                twitter=sanitize_optional(identity.get("twitter"), IDENTITY_FIELD_LIMITS["twitter"]),
+                github=sanitize_optional(identity.get("github"), IDENTITY_FIELD_LIMITS["github"]),
+                answers=answers,
             )
             with self._lock:
                 self.clients[client_sock] = profile
@@ -274,7 +413,7 @@ class Server:
                             "type": "chat",
                             "ts": utcnow(),
                             "text": text,
-                            "sender": dataclasses.asdict(profile),
+                            "sender": profile.to_dict(),
                         }
                         with self._lock:
                             self.messages.append(enriched)
@@ -289,6 +428,8 @@ class Server:
             with self._lock:
                 prof = self.clients.pop(client_sock, None)
                 self._rate_limits.pop(client_sock, None)
+                if prof:
+                    self.departed.append(prof)
             client_sock.close()
             if prof:
                 self._broadcast({"type": "system", "text": f"{prof.name} left", "ts": utcnow()})
@@ -332,8 +473,11 @@ class Server:
                 line = "/quit"
             if line.strip() == "/who":
                 with self._lock:
-                    names = [p.name for p in self.clients.values()]
-                print(f"Active: {', '.join(names) if names else 'nobody yet'}")
+                    active = [p.name for p in self.clients.values()]
+                    left = [p.name for p in self.departed]
+                print(f"Active: {', '.join(active) if active else 'nobody yet'}")
+                if left:
+                    print(f"Left: {', '.join(left)}")
             elif line.strip() == "/save":
                 self.write_summary()
                 print("Saved summary")
@@ -341,6 +485,7 @@ class Server:
                 self._shutdown.set()
                 break
         print("[host] Shutting down...")
+        self._broadcast({"type": "shutdown", "text": f"{self.session_name} over. Hosted by Flan Party \u2014 start your own (and \u2b50\ufe0f star us on GitHub) https://github.com/weisserj/flan-party", "ts": utcnow()})
         if self.server_sock:
             try:
                 self.server_sock.close()
@@ -353,16 +498,16 @@ class Server:
         summary_path = self.summary_dir / f"{now}_{self.session_name.replace(' ', '_')}_summary.md"
         email_path = summary_path.with_suffix(".email.txt")
         with self._lock:
-            participants = list(self.clients.values())
+            participants = list(self.clients.values()) + list(self.departed)
             messages = list(self.messages)
         lines = [f"# {self.session_name} — transcript", ""]
         lines.append("## Participants")
         if participants:
             for p in participants:
                 lines.append(f"- {p.name} <{p.email}> twitter: {p.twitter or '-'} github: {p.github or '-'}")
-                lines.append(f"  • working on: {p.working_on}")
-                lines.append(f"  • can help with: {p.can_help_with}")
-                lines.append(f"  • wants to talk about: {p.want_to_talk_about}")
+                for key, label in self.question_labels.items():
+                    answer = p.answers.get(key, "-")
+                    lines.append(f"  • {label}: {answer}")
         else:
             lines.append("- none connected")
         lines.append("")
@@ -376,24 +521,25 @@ class Server:
         summary_path.write_text("\n".join(lines), encoding="utf-8")
 
         email_lines = [f"Subject: {self.session_name} recap", ""]
-        email_lines.append("Thanks for joining the popup! Highlights and links below.\n")
-        email_lines.append("People & projects:")
+        email_lines.append(f"Thanks for joining {self.session_name}!\n")
+        email_lines.append("Who was there:")
         for p in participants:
-            email_lines.append(f"- {p.name}: {p.working_on} (can help with {p.can_help_with}; wants to talk about {p.want_to_talk_about})")
-        email_lines.append("\nLinks & ideas from chat:")
+            parts = "; ".join(f"{self.question_labels[k]}: {v}" for k, v in p.answers.items() if v)
+            email_lines.append(f"- {p.name}: {parts}" if parts else f"- {p.name}")
+        email_lines.append("\nFrom the chat:")
         for m in messages:
             email_lines.append(f"- {m['text']}")
-        email_lines.append("\nReply-all with updates or follow-ups!")
+        email_lines.append("\nSee you next time!")
         email_path.write_text("\n".join(email_lines), encoding="utf-8")
         print(f"[host] Wrote {summary_path} and {email_path}")
 
 
 class Client:
-    def __init__(self, host: str, port: int, profile: Profile, passphrase: Optional[str]):
+    def __init__(self, host: str, port: int, passphrase: Optional[str]):
         self.host = host
         self.port = port
-        self.profile = profile
         self.passphrase = passphrase
+        self.profile: Optional[Profile] = None
         self.sock: Optional[socket.socket] = None
         self._receiver_alive = threading.Event()
         self._unread_count = 0
@@ -421,8 +567,30 @@ class Client:
     def start(self) -> None:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.connect((self.host, self.port))
-        send_json(self.sock, {"type": "hello", "profile": dataclasses.asdict(self.profile), "passphrase": self.passphrase})
-        print(f"Connected to {self.host}:{self.port}. Type your messages; /quit to leave.")
+        # Receive question definitions from server
+        buffer = bytearray()
+        messages = recv_lines(self.sock, buffer)
+        if not messages or messages[0].get("type") != "welcome":
+            print("Error: unexpected server response")
+            self.sock.close()
+            return
+        questions = messages[0].get("questions", DEFAULT_QUESTIONS)
+        # Prompt user for profile
+        print(f"Connected to {self.host}:{self.port}")
+        self.profile = Profile.from_input(questions)
+        hello = {
+            "type": "hello",
+            "identity": {
+                "name": self.profile.name,
+                "email": self.profile.email,
+                "twitter": self.profile.twitter,
+                "github": self.profile.github,
+            },
+            "answers": self.profile.answers,
+            "passphrase": self.passphrase,
+        }
+        send_json(self.sock, hello)
+        print("Type your messages; /quit to leave.")
         set_terminal_title('\u26f5 Flan Party')
         self._receiver_alive.set()
         threading.Thread(target=self._recv_loop, daemon=True).start()
@@ -430,11 +598,18 @@ class Client:
 
     def _recv_loop(self) -> None:
         buffer = bytearray()
+        clean_shutdown = False
         try:
             while self._receiver_alive.is_set():
                 for msg in recv_lines(self.sock, buffer):
                     mtype = msg.get("type")
-                    if mtype == "system":
+                    if mtype == "shutdown":
+                        text = sanitize_text(msg.get("text", "Session ended"), MAX_MESSAGE_LEN)
+                        print(f"\n{text}")
+                        clean_shutdown = True
+                        self._receiver_alive.clear()
+                        return
+                    elif mtype == "system":
                         text = sanitize_text(msg.get("text", ""), MAX_MESSAGE_LEN)
                         print(f"[system] {text}")
                     elif mtype == "chat":
@@ -444,7 +619,8 @@ class Client:
                         if sender != self.profile.name:
                             self._add_unread(sender)
         except Exception:
-            print("[disconnected]")
+            if not clean_shutdown:
+                print("[disconnected]")
             self._receiver_alive.clear()
 
     def _send_loop(self) -> None:
@@ -480,9 +656,10 @@ def parse_args() -> argparse.Namespace:
     host_parser = sub.add_parser("host", help="start a popup session")
     host_parser.add_argument("--host", default="0.0.0.0", help="bind address (default all interfaces)")
     host_parser.add_argument("--port", type=int, default=5678)
-    host_parser.add_argument("--session-name", default="Late Night Coffeeshop")
+    host_parser.add_argument("--session-name", default=None)
     host_parser.add_argument("--summary-dir", default="summaries")
     host_parser.add_argument("--passphrase", default=None, help="optional shared passphrase required to join")
+    host_parser.add_argument("--questions", default=None, help="path to JSON file defining profile questions")
 
     join_parser = sub.add_parser("join", help="join an existing popup session")
     join_parser.add_argument("--host", required=True, help="host IP on the LAN")
@@ -495,13 +672,21 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if args.command == "host":
+        if args.questions:
+            try:
+                questions = load_questions_file(args.questions)
+            except ValueError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(1)
+            session_name = args.session_name or "Flan Party"
+        else:
+            session_name, questions = prompt_host_setup(args.session_name)
         summary_dir = Path(args.summary_dir)
-        server = Server(args.host, args.port, args.session_name, summary_dir, args.passphrase)
+        server = Server(args.host, args.port, session_name, summary_dir, args.passphrase, questions)
         signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
         server.start()
     elif args.command == "join":
-        profile = Profile.from_input()
-        client = Client(args.host, args.port, profile, args.passphrase)
+        client = Client(args.host, args.port, args.passphrase)
         client.start()
 
 
