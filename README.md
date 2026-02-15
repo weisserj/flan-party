@@ -6,20 +6,20 @@ Dead-simple local-only chat for any popup gathering. Host starts a room; everyon
 
 ## Quick start (host)
 ```bash
-python popup.py host
+python3 popup.py host
 ```
 
 You'll be prompted to name your session and configure questions for participants. Or skip the interactive setup:
 
 ```bash
-python popup.py host --session-name "Hack Night NYC" --questions questions.json --port 5678
+python3 popup.py host --session-name "Hack Night NYC" --questions questions.json --port 5678
 ```
 
 ## Quick start (participant)
 Download (no clone needed):
 ```bash
 curl -L -o popup.py https://raw.githubusercontent.com/weisserj/flan-party/weisserj/lan-cli-chat/popup.py
-python popup.py join --host 192.168.50.23 --port 5678 --passphrase [ASK HOST]
+python3 popup.py join --host 192.168.50.23 --port 5678 --passphrase [ASK HOST]
 ```
 
 ## What you get
