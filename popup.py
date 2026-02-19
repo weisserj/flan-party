@@ -336,6 +336,10 @@ class Server:
         self.server_sock.bind((self.host, self.port))
         self.server_sock.listen(20)
         print(f"[host] Session '{self.session_name}' listening on {self.host}:{self.port}")
+        print(f"[host] Questions ({len(self.questions)}):")
+        for i, q in enumerate(self.questions, 1):
+            req = "required" if q.get("required") else "optional"
+            print(f"  {i}. {q['prompt']} ({req})")
         threading.Thread(target=self._accept_loop, daemon=True).start()
         self._host_loop()
 
@@ -351,8 +355,8 @@ class Server:
     def _client_thread(self, client_sock: socket.socket, addr: Tuple[str, int]) -> None:
         buffer = bytearray()
         try:
-            # Send questions to client
-            send_json(client_sock, {"type": "welcome", "questions": self.questions})
+            # Send questions and session info to client
+            send_json(client_sock, {"type": "welcome", "session_name": self.session_name, "questions": self.questions})
             # Expect hello
             messages = recv_lines(client_sock, buffer)
             if not messages or messages[0].get("type") != "hello":
@@ -575,8 +579,9 @@ class Client:
             self.sock.close()
             return
         questions = messages[0].get("questions", DEFAULT_QUESTIONS)
-        # Prompt user for profile
-        print(f"Connected to {self.host}:{self.port}")
+        session_name = messages[0].get("session_name", "Flan Party")
+        # Welcome greeting
+        print(f"\nWelcome to {session_name} on Flan Party. This is a popup chat in CLI for local area networks.\n")
         self.profile = Profile.from_input(questions)
         hello = {
             "type": "hello",
